@@ -1,5 +1,9 @@
 # Speech to Text: Real-time Multilingual Transcription
 
+**🔗 Live demo: https://speech-to-text-4c27.onrender.com**
+
+Open it in **Google Chrome** or **Microsoft Edge**, allow the microphone, pick your language and click the mic. In other browsers (Firefox, Brave), live text uses Gemini and runs about 2.5 s behind your voice. The app is on Render's free plan, so the first visit after a while can take about a minute to wake up.
+
 Speak in any language, or mix languages the way people actually talk: Hindi + English, Kannada + English, Tamil + English, Spanish + English, and so on. Words appear on screen **as you speak, typically under half a second behind your voice**. When you stop, the whole recording gets a second, more accurate pass. Transcripts are saved to PostgreSQL and managed from a dashboard with full CRUD, search and export.
 
 ## Architecture
