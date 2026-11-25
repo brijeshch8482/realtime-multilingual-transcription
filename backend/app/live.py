@@ -18,6 +18,7 @@ Server -> browser (JSON)
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ SYSTEM_PROMPT = (
 AUDIO_MIME = "audio/pcm;rate=16000"
 IDLE_FINALIZE_SEC = 1.2  # commit a phrase if no new text arrives for this long
 STOP_DRAIN_SEC = 2.5  # after Stop, wait this long for trailing transcription
+REPLAY_BYTES = 3 * 2 * 16000  # on fallback to Gemini, replay the last 3 s of audio
 
 LANGUAGE_CODES = [
     c.strip() for c in os.getenv("LANGUAGE_CODES", "").split(",") if c.strip()
@@ -265,31 +267,79 @@ async def _run_session(ws: WebSocket, config: types.LiveConnectConfig, lang: str
 
 async def _run_browser_mode(ws: WebSocket, lang: str | None):
     """Browser mode: the browser's own recogniser (Chrome Web Speech API) shows the live
-    text with ~0.3-0.5 s latency. The server cleans up each phrase's script, records
-    the audio, and runs the accurate Gemini pass on Stop. No Gemini Live session."""
+    text with sub-second latency. The server cleans up each phrase's script, records the
+    audio, and runs the accurate Gemini pass on Stop.
+
+    If the browser's recogniser fails (e.g. Brave ships the API without Google's speech
+    service, or the network blocks it), the client sends {"type": "use_gemini"} and this
+    same session switches to Gemini Live for the live text - nothing recorded is lost."""
     await ws.send_json({"type": "ready"})
     transcript = _Transcript(ws)
     recording = bytearray()
     max_bytes = final_pass.MAX_SECONDS * 2 * final_pass.SAMPLE_RATE
-    while True:
-        msg = await ws.receive()
-        if msg["type"] == "websocket.disconnect":
-            return
-        if msg.get("bytes"):
-            if len(recording) < max_bytes:
-                recording.extend(msg["bytes"])
-            continue
+    session = None
+    results: asyncio.Task | None = None
+    async with contextlib.AsyncExitStack() as stack:
         try:
-            data = json.loads(msg.get("text") or "")
-        except ValueError:
-            continue
-        if data.get("type") == "phrase":
-            text = " ".join(str(data.get("text", "")).split())[:5000]
-            pid = str(data.get("id", ""))[:64]
-            if text and pid:
-                transcript.add_phrase(pid, text)
-        elif data.get("type") == "stop":
-            break
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    return
+                if msg.get("bytes"):
+                    if len(recording) < max_bytes:
+                        recording.extend(msg["bytes"])
+                    if session is not None:
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=msg["bytes"], mime_type=AUDIO_MIME)
+                        )
+                    continue
+                try:
+                    data = json.loads(msg.get("text") or "")
+                except ValueError:
+                    continue
+                kind = data.get("type")
+                if kind == "phrase":
+                    text = " ".join(str(data.get("text", "")).split())[:5000]
+                    pid = str(data.get("id", ""))[:64]
+                    if text and pid:
+                        transcript.add_phrase(pid, text)
+                elif kind == "use_gemini" and session is None:
+                    try:
+                        session = await stack.enter_async_context(
+                            _get_client().aio.live.connect(
+                                model=settings.gemini_model,
+                                config=_build_config(with_language_codes=False),
+                            )
+                        )
+                        results = asyncio.create_task(_pump_results(session, transcript))
+                        await ws.send_json({"type": "mode", "mode": "gemini"})
+                        # Replay the last few seconds so words spoken while the browser's
+                        # recogniser was failing still show up live.
+                        tail = bytes(recording[-REPLAY_BYTES:])
+                        for i in range(0, len(tail), 3200):
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=tail[i : i + 3200], mime_type=AUDIO_MIME)
+                            )
+                    except Exception as e:
+                        log.warning("fallback to Gemini Live failed: %s", e)
+                        await ws.send_json(
+                            {"type": "error", "message": f"Live fallback failed: {e}"}
+                        )
+                elif kind == "stop":
+                    if session is not None and results is not None:
+                        try:
+                            await session.send_realtime_input(audio_stream_end=True)
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(asyncio.shield(results), timeout=STOP_DRAIN_SEC)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                        await transcript.flush()
+                    break
+        finally:
+            if results is not None:
+                results.cancel()
     await _finish(ws, transcript, recording, lang)
 
 

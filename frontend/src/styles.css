@@ -142,6 +142,7 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
 .alert { padding: 10px 14px; border-radius: 10px; margin: 12px 0; font-size: 0.93em; }
 .alert-error { background: var(--danger-soft); color: var(--danger); }
 .alert-ok { background: var(--ok-soft); color: var(--ok); }
+.alert-info { background: var(--primary-soft); color: var(--text); }
 .alert-warn { background: var(--warn-soft); color: var(--warn); margin-top: 0; }
 .recorder .alert-error { margin-bottom: 0; }
 

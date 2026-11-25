@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { wsUrl } from "./api";
-import { AUTO, SpeechRecognitionImpl } from "./languages";
+import { AUTO, SpeechRecognitionImpl, instantSupported, markInstantBroken } from "./languages";
 
 // Two live modes, same accurate pass at the end:
 //  * instant (language chosen): Chrome's own recogniser (Web Speech API, Google) shows
@@ -20,6 +20,7 @@ export function useTranscriber() {
   const [speaking, setSpeaking] = useState(false);
   const [languages, setLanguages] = useState(null); // from the accurate final pass
   const [mode, setMode] = useState(null); // "instant" | "auto"
+  const [notice, setNotice] = useState(null); // non-error info (e.g. switched modes)
 
   const r = useRef({}); // ws, ctx, stream, node, timer, startedAt, ready, rec, ...
 
@@ -75,6 +76,33 @@ export function useTranscriber() {
     if (s.ws?.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({ type: "phrase", id, text }));
   }, []);
 
+  // Browser recogniser unavailable -> switch this session to Gemini Live for live text.
+  const fallbackToGemini = useCallback(
+    (reason) => {
+      const s = r.current;
+      if (s.fellBack) return;
+      s.fellBack = true;
+      s.recActive = false;
+      if (s.partial) {
+        commitPhrase(s.partial);
+        s.partial = "";
+        setPartial("");
+      }
+      if (s.rec) {
+        s.rec.onresult = s.rec.onerror = s.rec.onend = null;
+        try { s.rec.abort(); } catch {}
+        s.rec = null;
+      }
+      if (s.ws?.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({ type: "use_gemini" }));
+      setMode("auto");
+      setNotice(
+        `${reason} Switched to Gemini live transcription (words appear ~2.5 s after you say them). ` +
+          "For instant text, use Google Chrome or Microsoft Edge."
+      );
+    },
+    [commitPhrase]
+  );
+
   const startRecognition = useCallback(
     (lang) => {
       const s = r.current;
@@ -84,6 +112,7 @@ export function useTranscriber() {
       rec.interimResults = true;
       rec.maxAlternatives = 1;
       rec.onresult = (e) => {
+        s.recGotResult = true;
         let interim = "";
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const res = e.results[i];
@@ -98,14 +127,14 @@ export function useTranscriber() {
       rec.onspeechend = () => setSpeaking(false);
       rec.onerror = (e) => {
         if (e.error === "no-speech" || e.error === "aborted") return;
-        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-          s.recActive = false;
-          setError("The browser blocked live speech recognition. Allow the microphone, or choose “Auto-detect” as the language.");
+        if (e.error === "network" && s.recGotResult) return; // worked before: transient, onend restarts
+        if (e.error === "network" || e.error === "service-not-allowed") {
+          markInstantBroken(); // don't try the broken service again in this browser
+          fallbackToGemini("Your browser's speech service isn't reachable.");
         } else if (e.error === "language-not-supported") {
-          s.recActive = false;
-          setError("This browser can't recognise the selected language live. Choose “Auto-detect” instead; you'll still get an accurate transcript on Stop.");
-        } else if (e.error === "network") {
-          setError("Live recognition lost its connection. Keep speaking: the accurate transcript is still produced when you stop.");
+          fallbackToGemini("This browser can't recognise the selected language.");
+        } else if (e.error === "not-allowed") {
+          fallbackToGemini("The browser blocked its speech recogniser.");
         }
       };
       rec.onend = () => {
@@ -114,7 +143,7 @@ export function useTranscriber() {
           const now = Date.now();
           s.recRestarts = (s.recRestarts || []).filter((t) => now - t < 3000).concat(now);
           if (s.recRestarts.length > 5) {
-            s.recActive = false; // restarting in a tight loop -> give up
+            fallbackToGemini("The browser's speech recogniser keeps stopping.");
             return;
           }
           try { rec.start(); } catch {}
@@ -128,21 +157,24 @@ export function useTranscriber() {
       try {
         rec.start();
       } catch (e) {
-        setError(`Live recognition could not start: ${e?.message || e}`);
+        fallbackToGemini(`Live recognition could not start (${e?.message || e}).`);
       }
     },
-    [commitPhrase]
+    [commitPhrase, fallbackToGemini]
   );
 
   // ---- start / stop -------------------------------------------------------------------
   const start = useCallback(
     async (lang = AUTO) => {
       if (r.current.ws) return;
-      const instant = lang !== AUTO && !!SpeechRecognitionImpl;
+      const instant = lang !== AUTO && instantSupported;
       setError(null);
+      setNotice(null);
       const s = r.current;
       s.partial = "";
       s.seq = 0;
+      s.fellBack = false;
+      s.recGotResult = false;
       setMode(instant ? "instant" : "auto");
       setLanguages(null);
       setFinals([]);
@@ -209,6 +241,8 @@ export function useTranscriber() {
           // Accurate transcript of the whole recording replaces the live draft
           setFinals([{ id: "final", text: msg.text, accurate: true }]);
           setLanguages(msg.languages?.length ? msg.languages : null);
+        } else if (msg.type === "mode") {
+          setMode(msg.mode === "gemini" ? "auto" : "instant");
         } else if (msg.type === "speech") {
           setSpeaking(msg.active);
         } else if (msg.type === "error") {
@@ -256,7 +290,8 @@ export function useTranscriber() {
     setPartial("");
     setElapsed(0);
     setError(null);
+    setNotice(null);
   }, []);
 
-  return { status, finals, partial, error, level, elapsed, speaking, languages, mode, start, stop, reset };
+  return { status, finals, partial, error, notice, level, elapsed, speaking, languages, mode, start, stop, reset };
 }

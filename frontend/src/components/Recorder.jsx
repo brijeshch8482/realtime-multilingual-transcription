@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { api, detectLanguages, formatDuration } from "../lib/api";
-import { AUTO, INSTANT_LANGUAGES, instantSupported, loadLanguage, saveLanguage } from "../lib/languages";
+import {
+  AUTO,
+  INSTANT_LANGUAGES,
+  instantSupported,
+  instantUnavailableReason,
+  loadLanguage,
+  saveLanguage,
+} from "../lib/languages";
 import { useTranscriber } from "../lib/useTranscriber";
 import LangBadges from "./LangBadges";
 
@@ -106,7 +113,7 @@ export default function Recorder({ onSaved, health }) {
       <div className="lang-row">
         <label htmlFor="lang">Language</label>
         <select id="lang" className="input select" value={lang} onChange={onLang} disabled={busy}>
-          <optgroup label={instantSupported ? "⚡ Instant (pick the language you'll speak)" : "Instant mode needs Chrome or Edge"}>
+          <optgroup label={instantSupported ? "⚡ Instant (pick the language you'll speak)" : "⚡ Instant (needs Google Chrome or Microsoft Edge)"}>
             {INSTANT_LANGUAGES.map((l) => (
               <option key={l.code} value={l.code} disabled={!instantSupported}>
                 {l.label}
@@ -119,6 +126,13 @@ export default function Recorder({ onSaved, health }) {
         </select>
       </div>
 
+      {!instantSupported && !busy && (
+        <div className="note">
+          {instantUnavailableReason()} Live text uses Gemini here (~2.5 s behind your voice). For
+          instant text, open this page in Google Chrome or Microsoft Edge.
+        </div>
+      )}
+      {t.notice && <div className="alert alert-info">{t.notice}</div>}
       {t.error && <div className="alert alert-error">{t.error}</div>}
 
       <div className="transcript" ref={boxRef} aria-live="polite">

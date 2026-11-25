@@ -26,9 +26,36 @@ export const AUTO = "auto";
 
 const SR = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
 export const SpeechRecognitionImpl = SR || null;
-export const instantSupported = !!SR;
 
 const KEY = "stt.language";
+const BROKEN_KEY = "stt.instantBroken";
+
+// Brave (and some other Chromium browsers) expose the API but ship without Google's
+// speech service, so recognition always fails with a "network" error.
+export const isBrave = typeof navigator !== "undefined" && !!navigator.brave;
+
+function instantMarkedBroken() {
+  try {
+    return localStorage.getItem(BROKEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function markInstantBroken() {
+  try {
+    localStorage.setItem(BROKEN_KEY, "1");
+  } catch {}
+}
+
+export const instantSupported = !!SR && !isBrave && !instantMarkedBroken();
+
+export function instantUnavailableReason() {
+  if (!SR) return "This browser has no built-in speech recognition.";
+  if (isBrave) return "Brave doesn't include Google's speech service.";
+  if (instantMarkedBroken()) return "This browser's speech service didn't respond last time.";
+  return null;
+}
 
 export function loadLanguage() {
   try {
