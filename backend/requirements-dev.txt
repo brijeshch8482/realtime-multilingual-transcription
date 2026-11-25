@@ -1,0 +1,4 @@
+-r requirements.txt
+# Only for scripts/e2e_live_test.py (generates spoken Hinglish test audio)
+edge-tts>=7.0
+miniaudio>=1.61
