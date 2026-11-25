@@ -33,6 +33,16 @@ app.add_middleware(
 app.include_router(transcriptions.router)
 
 
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    # index.html must be revalidated so a redeploy is picked up immediately;
+    # hashed /assets/* files stay cacheable.
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.get("/api/health")
 def health():
     return {

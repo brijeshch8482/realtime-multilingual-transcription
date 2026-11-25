@@ -85,24 +85,32 @@ def _parse(raw: str) -> tuple[str, list[str]] | None:
     return (text, langs[:6]) if text else None
 
 
-def _instruction(draft: str) -> str:
+def _instruction(draft: str, lang_hint: str | None = None) -> str:
+    hint = ""
+    if lang_hint:
+        hint = (
+            f" The speaker selected '{lang_hint}' (BCP-47) as their main language; they "
+            "typically mix it with English, so expect mostly that language."
+        )
     if not draft.strip():
-        return "Transcribe this recording."
+        return "Transcribe this recording." + hint
     return (
-        "Transcribe this recording. For reference, a fast streaming recognizer produced "
+        "Transcribe this recording." + hint + " For reference, a fast streaming recognizer produced "
         "this draft, which may contain mistakes, missing words or even the wrong language "
         "- trust the audio over the draft, but follow its script choices for English "
         f"words when they match what is said:\n<draft>{draft[:4000]}</draft>"
     )
 
 
-async def _attempt(model: str, thinking: str, wav: bytes, draft: str, timeout: float):
+async def _attempt(
+    model: str, thinking: str, wav: bytes, draft: str, lang_hint: str | None, timeout: float
+):
     resp = await asyncio.wait_for(
         _get_client().aio.models.generate_content(
             model=model,
             contents=[
                 types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                _instruction(draft),
+                _instruction(draft, lang_hint),
             ],
             config=types.GenerateContentConfig(
                 system_instruction=PROMPT,
@@ -117,7 +125,9 @@ async def _attempt(model: str, thinking: str, wav: bytes, draft: str, timeout: f
     return _parse(resp.text)
 
 
-async def transcribe_recording(pcm: bytes, draft: str = "") -> tuple[str, list[str]] | None:
+async def transcribe_recording(
+    pcm: bytes, draft: str = "", lang_hint: str | None = None
+) -> tuple[str, list[str]] | None:
     """Return (transcript, languages), or None if unavailable / every model failed."""
     seconds = len(pcm) / (2 * SAMPLE_RATE)
     if not enabled() or seconds < 0.5:
@@ -132,7 +142,7 @@ async def transcribe_recording(pcm: bytes, draft: str = "") -> tuple[str, list[s
         if remaining < 2:
             break
         try:
-            result = await _attempt(model, thinking, wav, draft, remaining)
+            result = await _attempt(model, thinking, wav, draft, lang_hint, remaining)
             log.info("final pass by %s (%.1fs audio)", model, seconds)
             return result  # None = model heard no speech; don't second-guess it
         except asyncio.TimeoutError:

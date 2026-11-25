@@ -1,35 +1,42 @@
 # Speech to Text: Real-time Multilingual Transcription
 
-Speak in any language, or mix languages the way people actually talk: Hindi + English, Kannada + English, Tamil + English, Spanish + English, and so on. Words appear on screen **live as you speak**. When you stop, the whole recording gets a second, more accurate pass. Transcripts are saved to PostgreSQL and managed from a dashboard with full CRUD, search and export.
+Speak in any language, or mix languages the way people actually talk: Hindi + English, Kannada + English, Tamil + English, Spanish + English, and so on. Words appear on screen **as you speak, typically under half a second behind your voice**. When you stop, the whole recording gets a second, more accurate pass. Transcripts are saved to PostgreSQL and managed from a dashboard with full CRUD, search and export.
 
 ## Architecture
 
 ```
- Browser (React + Vite)                 Backend (FastAPI, Python)                      Google Gemini
- ──────────────────────                 ─────────────────────────                      ─────────────
- Mic → AudioWorklet → PCM16 16 kHz ─WS─► /ws/transcribe proxy ─────────WS──────────►  Gemini Live API
-                                         (API key never leaves server)                 (word-by-word draft)
- partial / final / revise  ◄──WS───────  per phrase: script clean-up ──────────────►  3.5-flash-lite (text)
- final_transcript          ◄──WS───────  on Stop: whole recording ─────────────────►  3.5-flash → fallbacks (audio)
-                                                                                       accurate transcript + languages
- Dashboard ──REST──────────────────────► /api/transcriptions  (CRUD, search, paging)
-                                         language ID in background ────────────────►  3.5-flash-lite (text)
+ Browser (React + Vite)                     Backend (FastAPI, Python)                  Google
+ ──────────────────────                     ─────────────────────────                  ──────
+ ⚡ Instant mode (language picked):
+ Chrome Web Speech API ─ interim words ~0.3-0.5 s ─► shown immediately                  (Google speech, in-browser)
+   finalised phrase ──────────WS──────────► phrase script clean-up ──────────────►  3.5-flash-lite (text)
+
+ Auto-detect mode (any language):
+ Mic → AudioWorklet → PCM16 ─WS──────────► Gemini Live proxy ────────WS─────────►  Gemini Live API (~2.5 s lag)
+
+ Both modes:
+ Mic → AudioWorklet → PCM16 16 kHz ─WS───► recording buffer
+ final_transcript ◄────────WS──────────── on Stop: whole recording ─────────────►  3.5-flash → fallbacks (audio)
+                                                                                   accurate transcript + languages
+ Dashboard ──REST──────────────────────► /api/transcriptions (CRUD, search, paging)
                                                    │
                                                    ▼
-                                            PostgreSQL (SQLAlchemy)  ·  SQLite fallback for dev
+                                       PostgreSQL (SQLAlchemy) · SQLite fallback for dev
 ```
 
 ### How a recording flows
-1. **Capture.** An AudioWorklet downsamples the mic to 16 kHz mono PCM16 and streams 100 ms chunks over a WebSocket.
-2. **Live draft (pass 1).** The backend forwards audio to a **Gemini Live** session (`gemini-2.5-flash-native-audio`) with input transcription on. Words stream back about 0.3 s apart and appear in grey. A phrase is committed when the speaker pauses.
-3. **Script clean-up (per phrase).** Gemini Live often writes English words in the other language's script (`प्रोजेक्ट`, `ಮೀಟಿಂಗ್`) or romanises Hindi (`aur fir`). A fast text model rewrites each committed phrase so **English is in Latin script and every other language is in its own script**. Nothing is translated. Each phrase updates in place about 0.7 s later.
-4. **Accurate pass (pass 2, on Stop).** Gemini Live's automatic language ID is fragile for some languages; in testing, Kannada sometimes came back as Burmese text or as English-sounding words. When you press Stop, the full recording is sent to a regular Gemini model, along with the draft as a hint. The model returns an accurate transcript plus ISO language codes. This replaces the draft. If every model fails (quota or timeout), the draft is kept.
-5. **Save.** The transcript is stored with its languages. Manually created or edited text gets its languages identified in a background task. The response returns instantly with a script-based guess.
+1. **Pick a language.** Choose the language you'll speak, which you can freely mix with English (Hindi, Kannada, Tamil, Telugu, Bengali, Marathi, Gujarati, Malayalam, Punjabi, Urdu, Spanish, French, Arabic, Chinese, Japanese, Korean…), or choose **Auto-detect**.
+2. **Live text: instant mode (default).** Chrome's built-in recogniser (Web Speech API, Google's speech service) shows words **typically within half a second of speaking**, in grey. A phrase turns final when you pause.
+3. **Live text: auto-detect mode.** Audio streams to a **Gemini Live** session that detects any language automatically. It is about 2.5 s behind speech; we measured this as the floor for every Gemini Live model, which is why instant mode exists. This mode is also used automatically in browsers without the Web Speech API (e.g. Firefox).
+4. **Script clean-up (per phrase).** Recognisers often write English words in the other language's script (`प्रोजेक्ट`, `ಮೀಟಿಂಗ್`) or romanise Hindi (`aur fir`). A fast text model rewrites each phrase so **English is in Latin script and every other language is in its own script**. Nothing is translated, and the phrase updates in place about 1 s later.
+5. **Accurate pass (on Stop).** Mic audio is streamed to the server in both modes. On Stop, the whole recording is sent to a regular Gemini model, together with the live text and the chosen language as hints. The returned transcript replaces the live draft and comes with ISO language codes. If every model fails (quota or timeout), the live text is kept.
+6. **Save.** The transcript is stored with its languages. Manually created or edited text gets its languages identified in a background task.
 
 ### Why these models (measured, not guessed)
 | Choice | Reason |
 |---|---|
-| Live: `gemini-2.5-flash-native-audio-preview-12-2025` | Streams the transcript word by word, with the first word about 2.5 s after speech starts. `gemini-3.1-flash-live-preview` returned each sentence only after it ended (about 7 s). |
+| Instant live text: Chrome Web Speech API | Interim words typically within half a second. Every Gemini Live model measured **2.5–2.7 s** to the first word (`2.5-flash-native-audio` variants), and `3.1-flash-live` / `3.8-live` took about 7.8 s. None of them sent low-latency interim transcripts. |
+| Auto-detect: `gemini-2.5-flash-native-audio-preview-12-2025` | The fastest Live model, and it streams word by word. It detects any language, but its language ID is fragile (Kannada sometimes came back as Burmese text, and Hindi flipped to Urdu script). The accurate pass fixes this on Stop. |
 | Live API version `v1alpha` | Newer `AQ.*` API keys get HTTP 404 on the `v1beta` Live endpoint. |
 | No `language_codes` hint | Testing showed the hints are ignored, and auto-detect handles any language. |
 | Clean-up: `gemini-3.5-flash-lite` | Took 0.7 s at the median (0.84 s at most) and gave the best script fixes of the models tested. |

@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 from fastapi import WebSocket, WebSocketDisconnect
 from google import genai
@@ -88,7 +89,7 @@ class _Transcript:
         self.interim = ""  # low-latency preview from interim_input_transcription
         self._idle_task: asyncio.Task | None = None
         self._seq = 0
-        self._texts: dict[int, str] = {}
+        self._texts: dict = {}  # phrase id -> text (insertion order = spoken order)
         self._revisions: set[asyncio.Task] = set()
 
     async def _send(self, payload: dict):
@@ -99,7 +100,17 @@ class _Transcript:
 
     def draft(self) -> str:
         """Full live transcript so far, using the cleaned-up version of each phrase."""
-        return " ".join(self._texts[k] for k in sorted(self._texts))
+        return " ".join(self._texts.values())
+
+    def add_phrase(self, pid, text: str):
+        """Browser mode: a phrase finalised by the browser's recogniser -> clean it up."""
+        self._texts[pid] = text
+        self._start_revision(pid, text)
+
+    def _start_revision(self, pid, text: str):
+        task = asyncio.create_task(self._revise(pid, text))
+        self._revisions.add(task)
+        task.add_done_callback(self._revisions.discard)
 
     def _current(self) -> str:
         # Prefer the longer view of the phrase so the preview never "shrinks".
@@ -134,11 +145,9 @@ class _Transcript:
             self._seq += 1
             self._texts[self._seq] = text
             await self._send({"type": "final", "id": self._seq, "text": text})
-            task = asyncio.create_task(self._revise(self._seq, text))
-            self._revisions.add(task)
-            task.add_done_callback(self._revisions.discard)
+            self._start_revision(self._seq, text)
 
-    async def _revise(self, seq: int, text: str):
+    async def _revise(self, seq, text: str):
         fixed = await normalize_script(text)
         if fixed:
             self._texts[seq] = fixed
@@ -211,7 +220,24 @@ async def _pump_audio(ws: WebSocket, session, recording: bytearray) -> bool:
                 return True
 
 
-async def _run_session(ws: WebSocket, config: types.LiveConnectConfig):
+async def _finish(ws: WebSocket, transcript: "_Transcript", recording: bytearray, lang: str | None):
+    """After Stop: wait for phrase clean-ups, run the accurate pass, then close."""
+    await transcript.wait_revisions(timeout=settings.normalize_timeout + 1)
+    if final_pass.enabled():
+        await ws.send_json({"type": "finalizing"})
+        result = await final_pass.transcribe_recording(
+            bytes(recording), draft=transcript.draft(), lang_hint=lang
+        )
+        if result:
+            text, langs = result
+            # Same script clean-up as live phrases (English words -> Latin)
+            text = await normalize_script(text) or text
+            await ws.send_json({"type": "final_transcript", "text": text, "languages": langs})
+    await ws.send_json({"type": "closed"})
+
+
+async def _run_session(ws: WebSocket, config: types.LiveConnectConfig, lang: str | None):
+    """Gemini Live mode: Gemini produces the live text (auto language, ~2.5 s latency)."""
     client = _get_client()
     async with client.aio.live.connect(model=settings.gemini_model, config=config) as session:
         await ws.send_json({"type": "ready"})
@@ -224,31 +250,50 @@ async def _run_session(ws: WebSocket, config: types.LiveConnectConfig):
             if results in done:  # Gemini side ended or failed
                 results.result()  # re-raise if it failed
                 return
-            stopped_by_user = audio.result()
-            if stopped_by_user:
+            if audio.result():  # stopped by the user
                 try:
                     await asyncio.wait_for(asyncio.shield(results), timeout=STOP_DRAIN_SEC)
                 except asyncio.TimeoutError:
                     pass
                 await transcript.flush()
-                await transcript.wait_revisions(timeout=settings.normalize_timeout + 1)
                 results.cancel()  # Live session no longer needed
-                if final_pass.enabled():
-                    await ws.send_json({"type": "finalizing"})
-                    result = await final_pass.transcribe_recording(
-                        bytes(recording), draft=transcript.draft()
-                    )
-                    if result:
-                        text, langs = result
-                        # Same script clean-up as live phrases (English words -> Latin)
-                        text = await normalize_script(text) or text
-                        await ws.send_json(
-                            {"type": "final_transcript", "text": text, "languages": langs}
-                        )
-                await ws.send_json({"type": "closed"})
+                await _finish(ws, transcript, recording, lang)
         finally:
             for t in (results, audio):
                 t.cancel()
+
+
+async def _run_browser_mode(ws: WebSocket, lang: str | None):
+    """Browser mode: the browser's own recogniser (Chrome Web Speech API) shows the live
+    text with ~0.3-0.5 s latency. The server cleans up each phrase's script, records
+    the audio, and runs the accurate Gemini pass on Stop. No Gemini Live session."""
+    await ws.send_json({"type": "ready"})
+    transcript = _Transcript(ws)
+    recording = bytearray()
+    max_bytes = final_pass.MAX_SECONDS * 2 * final_pass.SAMPLE_RATE
+    while True:
+        msg = await ws.receive()
+        if msg["type"] == "websocket.disconnect":
+            return
+        if msg.get("bytes"):
+            if len(recording) < max_bytes:
+                recording.extend(msg["bytes"])
+            continue
+        try:
+            data = json.loads(msg.get("text") or "")
+        except ValueError:
+            continue
+        if data.get("type") == "phrase":
+            text = " ".join(str(data.get("text", "")).split())[:5000]
+            pid = str(data.get("id", ""))[:64]
+            if text and pid:
+                transcript.add_phrase(pid, text)
+        elif data.get("type") == "stop":
+            break
+    await _finish(ws, transcript, recording, lang)
+
+
+_LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,4}){0,2}$")
 
 
 async def transcribe_ws(ws: WebSocket):
@@ -259,16 +304,23 @@ async def transcribe_ws(ws: WebSocket):
         )
         await ws.close()
         return
+    mode = ws.query_params.get("mode", "gemini")
+    lang = ws.query_params.get("lang") or None
+    if lang and not _LANG_RE.match(lang):
+        lang = None
     try:
+        if mode == "browser":
+            await _run_browser_mode(ws, lang)
+            return
         try:
-            await _run_session(ws, _build_config(with_language_codes=True))
+            await _run_session(ws, _build_config(with_language_codes=True), lang)
         except WebSocketDisconnect:
             raise
         except Exception as e:
             # Some models reject language_codes; retry once without them before failing.
             if LANGUAGE_CODES and "language" in str(e).lower():
                 log.warning("Retrying without language_codes: %s", e)
-                await _run_session(ws, _build_config(with_language_codes=False))
+                await _run_session(ws, _build_config(with_language_codes=False), lang)
             else:
                 raise
     except WebSocketDisconnect:
@@ -276,7 +328,7 @@ async def transcribe_ws(ws: WebSocket):
     except Exception as e:
         log.exception("Live session failed")
         try:
-            await ws.send_json({"type": "error", "message": f"Gemini Live error: {e}"})
+            await ws.send_json({"type": "error", "message": f"Transcription error: {e}"})
         except Exception:
             pass
     finally:

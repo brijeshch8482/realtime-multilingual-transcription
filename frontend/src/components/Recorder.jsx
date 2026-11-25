@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api, detectLanguages, formatDuration } from "../lib/api";
+import { AUTO, INSTANT_LANGUAGES, instantSupported, loadLanguage, saveLanguage } from "../lib/languages";
 import { useTranscriber } from "../lib/useTranscriber";
 import LangBadges from "./LangBadges";
 
 const STATUS_TEXT = {
   idle: "Ready",
-  connecting: "Connecting to Gemini…",
+  connecting: "Connecting…",
   listening: "Listening",
   stopping: "Finishing…",
   finalizing: "Improving accuracy…",
@@ -17,6 +18,7 @@ export default function Recorder({ onSaved, health }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(null);
   const [saveError, setSaveError] = useState(null);
+  const [lang, setLang] = useState(loadLanguage);
   const boxRef = useRef(null);
 
   const fullText = t.finals.map((f) => f.text).join(" ").trim();
@@ -34,7 +36,12 @@ export default function Recorder({ onSaved, health }) {
     setSaved(null);
     setSaveError(null);
     setTitle("");
-    t.start();
+    t.start(lang);
+  };
+
+  const onLang = (e) => {
+    setLang(e.target.value);
+    saveLanguage(e.target.value);
   };
 
   const onSave = async () => {
@@ -85,13 +92,31 @@ export default function Recorder({ onSaved, health }) {
           <div className="timer">{formatDuration(t.elapsed)}</div>
           <div className="hint">
             {busy
-              ? "Speak naturally in any language, or mix languages (e.g. Kannada + English). Click to stop."
-              : "Click the mic and start speaking."}
+              ? t.mode === "instant"
+                ? "Speak naturally, mixing English in as you like. Click to stop."
+                : "Speak in any language. Auto-detect shows words ~2.5 s after you say them. Click to stop."
+              : "Pick your language, click the mic and start speaking."}
           </div>
         </div>
         <div className="rec-langs">
           <LangBadges langs={langs} />
         </div>
+      </div>
+
+      <div className="lang-row">
+        <label htmlFor="lang">Language</label>
+        <select id="lang" className="input select" value={lang} onChange={onLang} disabled={busy}>
+          <optgroup label={instantSupported ? "⚡ Instant (pick the language you'll speak)" : "Instant mode needs Chrome or Edge"}>
+            {INSTANT_LANGUAGES.map((l) => (
+              <option key={l.code} value={l.code} disabled={!instantSupported}>
+                {l.label}
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="Any language">
+            <option value={AUTO}>Auto-detect any language (slower, ~2.5 s delay)</option>
+          </optgroup>
+        </select>
       </div>
 
       {t.error && <div className="alert alert-error">{t.error}</div>}
