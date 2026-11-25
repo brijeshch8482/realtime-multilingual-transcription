@@ -36,8 +36,17 @@ def detect_languages_by_script(text: str) -> list[str]:
     return langs
 
 
+_NON_LATIN = re.compile("[" + "".join(rng for _, rng in _SCRIPTS) + "]")
+
+
 def has_non_latin_script(text: str) -> bool:
-    return any(rx.search(text) for _, rx in _SCRIPT_RES)
+    return bool(_NON_LATIN.search(text))
+
+
+def non_latin_ratio(text: str) -> float:
+    """Share of letters written in a non-Latin script (0..1)."""
+    letters = sum(1 for ch in text if ch.isalpha()) or 1
+    return len(_NON_LATIN.findall(text)) / letters
 
 
 def default_title(text: str, words: int = 6) -> str:

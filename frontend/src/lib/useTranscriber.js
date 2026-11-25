@@ -66,15 +66,22 @@ export function useTranscriber() {
 
   useEffect(() => teardown, [teardown]);
 
+  // A phrase stays grey ("pending") until the server's script clean-up arrives; never
+  // leave it grey for long if that reply is slow or lost.
+  const settleLater = useCallback((id) => {
+    setTimeout(() => setFinals((f) => f.map((x) => (x.id === id && x.pending ? { ...x, pending: false } : x))), 6500);
+  }, []);
+
   // ---- instant mode: browser speech recognition -------------------------------------
   const commitPhrase = useCallback((text) => {
     const s = r.current;
     text = text.trim();
     if (!text) return;
     const id = `b${++s.seq}`;
-    setFinals((f) => [...f, { id, text }]);
+    setFinals((f) => [...f, { id, text, pending: true }]);
+    settleLater(id);
     if (s.ws?.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({ type: "phrase", id, text }));
-  }, []);
+  }, [settleLater]);
 
   // Browser recogniser unavailable -> switch this session to Gemini Live for live text.
   const fallbackToGemini = useCallback(
@@ -227,12 +234,15 @@ export function useTranscriber() {
           s.partial = msg.text;
           setPartial(msg.text);
         } else if (msg.type === "final") {
-          setFinals((f) => [...f, { id: msg.id, text: msg.text }]);
+          setFinals((f) => [...f, { id: msg.id, text: msg.text, pending: true }]);
+          settleLater(msg.id);
           s.partial = "";
           setPartial("");
         } else if (msg.type === "revise") {
           // Same phrase with scripts fixed (English words in Latin, etc.)
-          setFinals((f) => f.map((x) => (x.id === msg.id ? { ...x, text: msg.text, revised: true } : x)));
+          setFinals((f) =>
+            f.map((x) => (x.id === msg.id ? { ...x, text: msg.text, pending: false, revised: x.text !== msg.text } : x))
+          );
         } else if (msg.type === "finalizing") {
           setStatus("finalizing");
           clearTimeout(s.stopTimeout);

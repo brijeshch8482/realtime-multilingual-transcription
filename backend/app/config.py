@@ -25,6 +25,7 @@ class Settings:
     # Small text model for script clean-up of live phrases and language ID on save.
     # Empty = disabled (raw Gemini Live output + offline script-based language tags).
     normalize_model: str = os.getenv("NORMALIZE_MODEL", "gemini-3.5-flash-lite").strip()
+    normalize_backup_model: str = os.getenv("NORMALIZE_BACKUP_MODEL", "gemini-3.1-flash-lite").strip()
     normalize_timeout: float = float(os.getenv("NORMALIZE_TIMEOUT", "5"))
     # Accurate pass over the whole recording on Stop: "model[:thinking_level]" tried in
     # order (free-tier quotas are per model, and models are sometimes overloaded).

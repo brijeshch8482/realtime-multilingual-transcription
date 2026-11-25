@@ -31,6 +31,7 @@ from google.genai import types
 from . import final_pass
 from .config import settings
 from .normalize import normalize_script
+from .textutil import has_non_latin_script
 
 log = logging.getLogger("live")
 DEBUG_RAW = os.getenv("LIVE_DEBUG", "") == "1"
@@ -153,7 +154,8 @@ class _Transcript:
         fixed = await normalize_script(text)
         if fixed:
             self._texts[seq] = fixed
-            await self._send({"type": "revise", "id": seq, "text": fixed})
+        # Always reply so the UI can mark the phrase as done (grey -> black).
+        await self._send({"type": "revise", "id": seq, "text": fixed or text})
 
     async def wait_revisions(self, timeout: float):
         if self._revisions:
@@ -223,8 +225,9 @@ async def _pump_audio(ws: WebSocket, session, recording: bytearray) -> bool:
 
 
 async def _finish(ws: WebSocket, transcript: "_Transcript", recording: bytearray, lang: str | None):
-    """After Stop: wait for phrase clean-ups, run the accurate pass, then close."""
-    await transcript.wait_revisions(timeout=settings.normalize_timeout + 1)
+    """After Stop: run the accurate pass (it replaces the phrase clean-ups), then close."""
+    # Clean-ups only improve the draft used as a hint; don't hold Stop up for them.
+    await transcript.wait_revisions(timeout=0.8 if final_pass.enabled() else settings.normalize_timeout + 0.5)
     if final_pass.enabled():
         await ws.send_json({"type": "finalizing"})
         result = await final_pass.transcribe_recording(
@@ -232,8 +235,10 @@ async def _finish(ws: WebSocket, transcript: "_Transcript", recording: bytearray
         )
         if result:
             text, langs = result
-            # Same script clean-up as live phrases (English words -> Latin)
-            text = await normalize_script(text) or text
+            # The accurate pass normally separates scripts itself (mixed Latin + native
+            # script). Only clean up when it didn't, so Stop isn't slowed down needlessly.
+            if not (has_non_latin_script(text) and _LATIN_LETTER.search(text)):
+                text = await normalize_script(text) or text
             await ws.send_json({"type": "final_transcript", "text": text, "languages": langs})
     await ws.send_json({"type": "closed"})
 
@@ -343,6 +348,7 @@ async def _run_browser_mode(ws: WebSocket, lang: str | None):
     await _finish(ws, transcript, recording, lang)
 
 
+_LATIN_LETTER = re.compile(r"[A-Za-z]")
 _LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,4}){0,2}$")
 
 

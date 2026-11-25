@@ -18,12 +18,14 @@ from google import genai
 from google.genai import types
 
 from .config import settings
+from .normalize import looks_translated
 
 log = logging.getLogger("final_pass")
 
 SAMPLE_RATE = 16000
 # Inline requests are limited to ~20 MB; 16 kHz PCM16 is 32 KB/s -> cap ~9 minutes.
 MAX_SECONDS = 540
+HEDGE_AFTER = 6.0  # seconds before also asking the next model in the chain
 
 PROMPT = (
     "Transcribe this speech recording exactly as spoken. Speakers often mix English "
@@ -128,7 +130,11 @@ async def _attempt(
 async def transcribe_recording(
     pcm: bytes, draft: str = "", lang_hint: str | None = None
 ) -> tuple[str, list[str]] | None:
-    """Return (transcript, languages), or None if unavailable / every model failed."""
+    """Return (transcript, languages), or None if unavailable / every model failed.
+
+    Models in FINAL_MODELS are tried as a hedged chain: if the current model fails
+    (quota/overload) the next starts at once, and if it is merely slow, the next is
+    started after HEDGE_AFTER seconds as well - the first good answer wins."""
     seconds = len(pcm) / (2 * SAMPLE_RATE)
     if not enabled() or seconds < 0.5:
         return None
@@ -136,20 +142,56 @@ async def transcribe_recording(
         log.info("recording too long for inline final pass (%.0fs); keeping draft", seconds)
         return None
     wav = _to_wav(pcm)
-    deadline = time.monotonic() + settings.final_timeout
-    for model, thinking in settings.final_models:
-        remaining = deadline - time.monotonic()
-        if remaining < 2:
-            break
-        try:
-            result = await _attempt(model, thinking, wav, draft, lang_hint, remaining)
-            log.info("final pass by %s (%.1fs audio)", model, seconds)
-            return result  # None = model heard no speech; don't second-guess it
-        except asyncio.TimeoutError:
-            log.warning("final pass: %s timed out", model)
-            break
-        except Exception as e:
-            # 429 quota / 503 overloaded / 400 unsupported option -> try the next model
-            log.warning("final pass: %s failed (%s), trying next", model, str(e)[:160])
-    log.warning("final pass unavailable; keeping live draft")
-    return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + settings.final_timeout
+    queue = list(settings.final_models)
+    running: dict[asyncio.Task, str] = {}
+
+    def launch():
+        model, thinking = queue.pop(0)
+        task = asyncio.create_task(
+            _attempt(model, thinking, wav, draft, lang_hint, max(2.0, deadline - loop.time()))
+        )
+        running[task] = model
+
+    try:
+        launch()
+        while running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, _ = await asyncio.wait(
+                set(running),
+                timeout=min(remaining, HEDGE_AFTER) if queue else remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                if queue:
+                    log.info("final pass: %s is slow, also asking %s", ", ".join(running.values()), queue[0][0])
+                    launch()
+                continue
+            for task in done:
+                model = running.pop(task)
+                try:
+                    result = task.result()
+                except Exception as e:
+                    # 429 quota / 503 overloaded / timeout -> next model
+                    log.warning("final pass: %s failed (%s)", model, str(e)[:160])
+                    result = False
+                if result is None:
+                    log.info("final pass by %s: no speech (%.1fs audio)", model, seconds)
+                    return None
+                if result:
+                    text, langs = result
+                    if draft and looks_translated(draft, text):
+                        log.warning("final pass: %s translated the speech; rejected", model)
+                    else:
+                        log.info("final pass by %s (%.1fs audio)", model, seconds)
+                        return result
+                if queue and not running:
+                    launch()
+        log.warning("final pass unavailable; keeping live draft")
+        return None
+    finally:
+        for task in running:
+            task.cancel()

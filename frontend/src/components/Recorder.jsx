@@ -142,7 +142,7 @@ export default function Recorder({ onSaved, health }) {
           </p>
         )}
         {t.finals.map((f) => (
-          <span key={f.id} className={`final ${f.revised ? "revised" : ""}`}>{f.text} </span>
+          <span key={f.id} className={`final ${f.pending ? "pending" : ""} ${f.revised ? "revised" : ""}`}>{f.text} </span>
         ))}
         {t.partial && <span className="partial">{t.partial}</span>}
       </div>

@@ -16,9 +16,11 @@ from google import genai
 from google.genai import types
 
 from .config import settings
-from .textutil import has_non_latin_script
+from .textutil import detect_languages_by_script, has_non_latin_script
 
 log = logging.getLogger("normalize")
+
+HEDGE_AFTER = 1.0  # seconds before also asking the backup model
 
 PROMPT = (
     "You fix the script of a code-mixed speech transcript in which the speaker mixes "
@@ -43,6 +45,15 @@ ROMAN_HINDI = re.compile(
     re.IGNORECASE,
 )
 
+# Very common Hindi function words (Devanagari). If these disappear from a rewrite,
+# the model translated instead of fixing the script.
+HINDI_FUNCTION_WORDS = re.compile(
+    "(?<![ऀ-ॿ])("
+    "है|हैं|था|थी|थे|का|की|के|को|से|में|पर|और|नहीं|क्या|क्यों|कैसे|हो|रहा|रही|रहे|"
+    "मैं|हम|तुम|आप|मेरा|मेरी|तेरा|हमारा|यह|ये|वह|वो|भी|तो|कल|आज|अभी|यार|भाई|ठीक"
+    ")(?![ऀ-ॿ])"
+)
+
 _client: genai.Client | None = None
 
 
@@ -62,32 +73,79 @@ def _get_client() -> genai.Client:
     return _client
 
 
+def looks_translated(raw: str, fixed: str) -> bool:
+    """True if real Hindi in `raw` vanished from `fixed` (translated, not re-scripted).
+
+    A phrase that is *entirely English* written in Devanagari ("आई डोंट नो") rightly
+    becomes all-Latin, so we only object when genuine Hindi words were present."""
+    hindi_words = len(HINDI_FUNCTION_WORDS.findall(raw))
+    if hindi_words >= 2 and not HINDI_FUNCTION_WORDS.search(fixed) and not ROMAN_HINDI.search(fixed):
+        return True
+    return False
+
+
 def _plausible(raw: str, fixed: str) -> bool:
-    # Guard against the model answering/expanding instead of rewriting.
-    return bool(fixed) and 0.5 <= len(fixed) / max(1, len(raw)) <= 1.6
+    # Guard against the model answering/expanding instead of rewriting...
+    if not fixed or not 0.5 <= len(fixed) / max(1, len(raw)) <= 1.6:
+        return False
+    # ...against translating Hindi into English...
+    if looks_translated(raw, fixed):
+        log.warning("normalize output looks translated; rejected")
+        return False
+    # ...and against introducing a script that wasn't spoken (e.g. Bengali letters
+    # appearing in a Hindi phrase). Latin is always allowed (English words).
+    new_scripts = set(detect_languages_by_script(fixed)) - set(detect_languages_by_script(raw)) - {"en"}
+    if new_scripts:
+        log.warning("normalize output added script(s) %s; rejected", sorted(new_scripts))
+        return False
+    return True
+
+
+async def _ask(model: str, text: str) -> str | None:
+    resp = await _get_client().aio.models.generate_content(
+        model=model,
+        contents=text,
+        config=types.GenerateContentConfig(system_instruction=PROMPT, temperature=0),
+    )
+    return " ".join((resp.text or "").split()) or None
 
 
 async def normalize_script(text: str) -> str | None:
-    """Return the normalised text, or None if unchanged / unavailable."""
+    """Return the normalised text, or None if unchanged / unavailable.
+
+    Hedged request: the primary model usually answers in ~0.7 s but sometimes stalls
+    for 5 s+, so if it hasn't answered after HEDGE_AFTER seconds the backup model is
+    asked too and the first good answer wins."""
     if not enabled() or not needs_fix(text):
         return None  # plain English -> nothing to fix
+    models = [settings.normalize_model]
+    if settings.normalize_backup_model and settings.normalize_backup_model not in models:
+        models.append(settings.normalize_backup_model)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + settings.normalize_timeout
+    pending = {asyncio.create_task(_ask(models[0], text))}
+    backups = models[1:]
     try:
-        resp = await asyncio.wait_for(
-            _get_client().aio.models.generate_content(
-                model=settings.normalize_model,
-                contents=text,
-                config=types.GenerateContentConfig(
-                    system_instruction=PROMPT,
-                    temperature=0,
-                ),
-            ),
-            timeout=settings.normalize_timeout,
-        )
-        fixed = " ".join((resp.text or "").split())
-        if fixed and fixed != text and _plausible(text, fixed):
-            return fixed
-    except asyncio.TimeoutError:
-        log.warning("normalize timed out; keeping raw text")
-    except Exception as e:
-        log.warning("normalize failed: %s", e)
-    return None
+        while pending:
+            wait = deadline - loop.time()
+            if backups:
+                wait = min(wait, HEDGE_AFTER)
+            if wait <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    fixed = task.result()
+                except Exception as e:
+                    log.warning("normalize call failed: %s", str(e)[:160])
+                    continue
+                if fixed and _plausible(text, fixed):
+                    return fixed if fixed != text else None
+            if backups and (not done or not pending):
+                # primary slow (or failed) -> hedge with the backup model
+                pending.add(asyncio.create_task(_ask(backups.pop(0), text)))
+        log.warning("normalize: no usable answer in %.1fs; keeping raw text", settings.normalize_timeout)
+        return None
+    finally:
+        for task in pending:
+            task.cancel()
